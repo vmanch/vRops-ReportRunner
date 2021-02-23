@@ -1,6 +1,6 @@
 #Powershell script which runs vRops report via the suite-api and downloads them locally
 #v1.0 vMan.ch, 21.06.2016 - Initial Version
-
+#v1.1 vMan.ch, 20.02.2021 - Updated to support Token based Auth and script can be run with params now.
 <#
 
     The following command must be run once to generate the Credential file to connect to each environment.
@@ -8,44 +8,99 @@
         Run once for per virtual center 
         
         $cred = Get-Credential
-        $cred | Export-Clixml -Path "c:\vRops\Config\vc.xml"
+        $cred | Export-Clixml -Path "G:\D-DRIVE\vRops\Config\vrops.xml"
+		
+		.\vROpsReportRunner.ps1 -vRopsAddress vRops.vman.ch -cred 'vrops' -vCenter 'bff52171-f5fb-4850-9ddb-92a46427773b' -Report '90f80540-c8af-497f-abbb-8174099e1af3' -format 'csv' -filename 'MySuperDupervRopsReport'
 
 #>
 
+param
+(
+    [String]$vRopsAddress,
+    [String]$Creds,
+    [String]$vCenter,
+    [String]$Report,
+    [String]$Format,
+    [String]$FileName
+)
+
+
 #vars
 $ScriptPath = (Get-Item -Path ".\" -Verbose).FullName
-$Output = $ScriptPath  +'\Reports\'
-$vRopsAddress = 'vc.vman.local'
-$vRopsCreds = Import-Clixml -Path "$ScriptPath\config\VC.xml"
-$vCenter = '7d3a8453-6559-4d4c-9005-3f8655e4394f'
-$Report = '1f66552f-7bb4-4d2c-9661-81a811de19b0'
+
+
+#Get Stored Credentials
+if($creds -gt ""){
+
+    $cred = Import-Clixml -Path "$ScriptPath\config\$creds.xml"
+
+    }
+    else
+    {
+    echo "Environment not selected, stop hammer time!"
+    Exit
+    }
 
 ## Function
 
-Function GetReport([String]$vRopsAddress, [String]$vCenter, [String]$Report, [String]$Env, $vRopsCreds, $Path){
-
-Write-host 'Running Report for' $Env
-
-#Take all certs.
-add-type @"
-    using System.Net;
-    using System.Security.Cryptography.X509Certificates;
-    public class TrustAllCertsPolicy : ICertificatePolicy {
-        public bool CheckValidationResult(
-            ServicePoint srvPoint, X509Certificate certificate,
-            WebRequest request, int certificateProblem) {
-            return true;
-        }
+Function New-vRopsToken {
+    [CmdletBinding()]param(
+        [PSCredential]$credentialFile,
+        [string]$vROPSServer
+    )
+    
+    if ($vROPSServer -eq $null -or $vROPSServer -eq '') {
+        $vROPSServer = ""
     }
-"@
+
+    $vROPSUser = $credentialFile.UserName
+    $vROPSPassword = $credentialFile.GetNetworkCredential().Password
+
+    if ("TrustAllCertsPolicy" -as [type]) {} else {
+    add-type @"
+        using System.Net;
+        using System.Security.Cryptography.X509Certificates;
+        public class TrustAllCertsPolicy : ICertificatePolicy {
+            public bool CheckValidationResult(
+                ServicePoint srvPoint, X509Certificate certificate,
+                WebRequest request, int certificateProblem) {
+                return true;
+            }
+        }
+"@ 
 [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+    }
+
+    $BaseURL = "https://" + $vROPsServer + "/suite-api/api/"
+    $BaseAuthURL = "https://" + $vROPsServer + "/suite-api/api/auth/token/acquire"
+    $Type = "application/json"
+
+    $AuthJSON =
+    "{
+      ""username"": ""$vROPSUser"",
+      ""password"": ""$vROPsPassword""
+    }"
+
+    Try { $vROPSSessionResponse = Invoke-RestMethod -Method POST -Uri $BaseAuthURL -Body $AuthJSON -ContentType $Type }
+    Catch {
+        $_.Exception.ToString()
+        $error[0] | Format-List -Force
+    }
+
+    $vROPSSessionHeader = @{"Authorization"="vRealizeOpsToken "+$vROPSSessionResponse.'auth-token'.token 
+    "Accept"="application/xml"}
+    $vROPSSessionHeader.add("X-vRealizeOps-API-use-unsupported","true")
+    return $vROPSSessionHeader
+}
+
+Function GetReport([String]$vRopsAddress, [String]$vCenter, [String]$Report, $Creds, [String]$Path, [String]$File, [String]$format){
+
+Write-host "Running Report"
 
 
 #RUN Report
 
 $ContentType = "application/xml;charset=utf-8"
-$header = New-Object "System.Collections.Generic.Dictionary[[String],[String]]"
-$header.Add("Accept", 'application/xml')
 
 $RunReporturl = 'https://'+$vRopsAddress+'/suite-api/api/reports'
 
@@ -62,36 +117,41 @@ $Body = @"
 </ops:report>
 "@
 
+$vRopsAdminToken = New-vRopsToken $cred $vRopsAddress
 
-[xml]$Data = Invoke-RestMethod -Method POST -uri $RunReporturl -Credential $vRopsCreds -ContentType $ContentType -Headers $header -Body $body
 
-$ReportLink = $Data.report.links.link.href
 
-$ReportLinkurl = 'https://' + $vRopsAddress + $ReportLink
+[xml]$Data = Invoke-RestMethod -Method POST -uri $RunReporturl -ContentType $ContentType -Headers $vRopsAdminToken -Body $body
+
+$ReportLink = $Data.report.links.link | where 'rel' -eq "SELF" | select href
+
+$ReportLinkurl = 'https://' + $vRopsAddress + ($ReportLink).href
 
 #Check if report is run to download
 
-[xml]$ReportStatus = Invoke-RestMethod -Method GET -uri $ReportLinkurl -Credential $vRopsCreds -ContentType $ContentType -Headers $header
+[xml]$ReportStatus = Invoke-RestMethod -Method GET -uri $ReportLinkurl -ContentType $ContentType -Headers $vRopsAdminToken
 
 
 While ($ReportStatus.report.status -ne "COMPLETED") {
-    [xml]$ReportStatus = Invoke-RestMethod -Method GET -uri $ReportLinkurl -Credential $vRopsCreds -ContentType $ContentType -Headers $header
+    [xml]$ReportStatus = Invoke-RestMethod -Method GET -uri $ReportLinkurl -Credential $vRopsCreds -ContentType $ContentType -Headers $vRopsAdminToken
     Write-host 'Waiting for' $Env 'report to finish running, current status: '  $ReportStatus.report.status
     Sleep 3
       } # End of block statement
 
 
-$ReportDownload = $ReportLinkurl + '/download?format=CSV'
+$ReportDownload = $ReportLinkurl + '/download?format='+ $Format
 
 
-$ReportOutputfile = $Path + '\collections\' + $Env + '_OversizedVMReport.csv'
+$ReportOutputfile = "$Path\reports\$File.$format"
 
-Invoke-RestMethod -Method GET -uri $ReportDownload -Credential $vRopsCreds -ContentType $ContentType -Headers $header -OutFile $ReportOutputfile
+Invoke-RestMethod -Method GET -uri $ReportDownload -Credential $vRopsCreds -ContentType $ContentType -Headers $vRopsAdminToken -OutFile $ReportOutputfile
 
-Write-host 'Report for' $Env 'finished'
+Write-host "Report finished"
 
 return $ReportOutputfile
 }
 
 
-$Report = GetReport $vRopsAddress $vCenter $Report 'VC' $vRopsCreds $ScriptPath
+$Report = GetReport $vRopsAddress $vCenter $Report $Cred $ScriptPath $FileName $Format
+
+Remove-Variable *  -Force -ErrorAction SilentlyContinue
